@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, utimesSync, closeSync, openSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 import { readCache, writeCache } from "./cache.js";
 import { collectCosts } from "./collector.js";
@@ -11,8 +11,8 @@ const ANTHROPIC_TTL_MS = 300_000;
 // ccclub rank: self-hosted, no strict limits — refresh more aggressively for visible data.
 const CCCLUB_TTL_MS = 90_000;
 
-const REFRESH_LOCK = "/tmp/sl-refresh.lock";
-const REFRESH_LAST = "/tmp/sl-refresh.last";
+const REFRESH_LOCK = join(tmpdir(), "sl-refresh.lock");
+const REFRESH_LAST = join(tmpdir(), "sl-refresh.last");
 const LOCK_STALE_MS = 60_000;
 
 function acquireLock(): boolean {
@@ -67,8 +67,8 @@ function refreshLocalCost(transcriptPath: string): void {
 }
 
 function refreshClaudeUsage(): void {
-  const cacheFile = "/tmp/sl-claude-usage";
-  const hitFile = "/tmp/sl-claude-usage-hit";
+  const cacheFile = join(tmpdir(), "sl-claude-usage");
+  const hitFile = join(tmpdir(), "sl-claude-usage-hit");
   const now = Date.now();
 
   let staleData: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null = null;
@@ -83,11 +83,27 @@ function refreshClaudeUsage(): void {
     } catch {}
   }
 
+  // Get current token — cross-platform:
+  //   macOS: Keychain first (Claude Code 2.x), then file fallback
+  //   Windows/Linux: ~/.claude/.credentials.json (Claude Code stores tokens there)
   let accessToken = "";
   try {
-    const username = process.env.USER || process.env.USERNAME;
-    const keychainCmd = `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w 2>/dev/null`;
-    const credentialsJSON = execSync(keychainCmd, { encoding: "utf-8", timeout: 2000 }).trim();
+    let credentialsJSON = "";
+    if (process.platform === "darwin") {
+      try {
+        const username = process.env.USER || process.env.USERNAME;
+        const keychainCmd = `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w 2>/dev/null`;
+        credentialsJSON = execSync(keychainCmd, { encoding: "utf-8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+      } catch {
+        // Keychain miss — fall through to file fallback
+      }
+    }
+    if (!credentialsJSON) {
+      const credPath = join(homedir(), ".claude", ".credentials.json");
+      if (existsSync(credPath)) {
+        credentialsJSON = readFileSync(credPath, "utf-8");
+      }
+    }
     if (!credentialsJSON) return;
     const credentials = JSON.parse(credentialsJSON);
     accessToken = credentials.claudeAiOauth?.accessToken || "";
@@ -110,10 +126,10 @@ function refreshClaudeUsage(): void {
   try {
     const apiUrl = "https://api.anthropic.com/api/oauth/usage";
     const curlCmd = `curl -sf "${apiUrl}" -H "Authorization: Bearer ${accessToken}" -H "anthropic-beta: oauth-2025-04-20"`;
-    const response = execSync(curlCmd, { encoding: "utf-8", timeout: 5000 });
+    const response = execSync(curlCmd, { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
     if (!response) return;
     const data = JSON.parse(response);
-    try { writeFileSync("/tmp/sl-claude-usage-raw", JSON.stringify(data, null, 2), "utf-8"); } catch {}
+    try { writeFileSync(join(tmpdir(), "sl-claude-usage-raw"), JSON.stringify(data, null, 2), "utf-8"); } catch {}
 
     const parseUtil = (val: any): number => {
       if (typeof val === "number") return Math.round(val);
@@ -152,7 +168,7 @@ function refreshClaudeUsage(): void {
 function refreshCcclubRank(): void {
   const configPath = join(homedir(), ".ccclub", "config.json");
   if (!existsSync(configPath)) return;
-  const cacheFile = "/tmp/sl-ccclub-rank";
+  const cacheFile = join(tmpdir(), "sl-ccclub-rank");
   const now = Date.now();
 
   let staleData: { rank: number; total: number; cost: number } | null = null;
@@ -176,7 +192,7 @@ function refreshCcclubRank(): void {
     if (!code || !userId) return;
     const tz = -(new Date()).getTimezoneOffset();
     const url = `${config.apiUrl}/api/rank/${code}?period=today&tz=${tz}`;
-    const response = execSync(`curl -sf "${url}"`, { encoding: "utf-8", timeout: 5000 });
+    const response = execSync(`curl -sf "${url}"`, { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
     if (!response) return;
     const data = JSON.parse(response);
     const rankings = data.rankings || [];
