@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, utimesSync, closeSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readCache, writeCache } from "./cache.js";
 import { collectCosts } from "./collector.js";
 import { shouldRefreshLocalCostCache } from "./statusline.js";
@@ -73,60 +74,80 @@ function refreshClaudeUsage(): void {
 
   let staleData: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null = null;
   let lastAttempt = 0;
-  let cachedTokenPrefix = "";
+  let cachedTokenHash = "";
   if (existsSync(cacheFile)) {
     try {
       const cached = JSON.parse(readFileSync(cacheFile, "utf-8"));
       staleData = cached.data ?? null;
       lastAttempt = cached.lastAttempt || 0;
-      cachedTokenPrefix = cached.tokenPrefix || "";
+      cachedTokenHash = cached.tokenHash || "";
     } catch {}
   }
 
-  // Get current token — cross-platform:
+  // Get current token — cross-platform. Try each candidate until one yields a
+  // valid, non-expired token; this way a Keychain that returns garbage or an
+  // expired entry still falls through to the file fallback.
   //   macOS: Keychain first (Claude Code 2.x), then file fallback
   //   Windows/Linux: ~/.claude/.credentials.json (Claude Code stores tokens there)
   let accessToken = "";
-  try {
-    let credentialsJSON = "";
-    if (process.platform === "darwin") {
+  const credentialLoaders: Array<() => string | null> = [];
+  if (process.platform === "darwin") {
+    credentialLoaders.push(() => {
       try {
-        const username = process.env.USER || process.env.USERNAME;
-        const keychainCmd = `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w 2>/dev/null`;
-        credentialsJSON = execSync(keychainCmd, { encoding: "utf-8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+        const username = process.env.USER || process.env.USERNAME || "";
+        return execFileSync(
+          "security",
+          ["find-generic-password", "-s", "Claude Code-credentials", "-a", username, "-w"],
+          { encoding: "utf-8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }
+        ).trim();
       } catch {
-        // Keychain miss — fall through to file fallback
+        return null;
       }
-    }
-    if (!credentialsJSON) {
-      const credPath = join(homedir(), ".claude", ".credentials.json");
-      if (existsSync(credPath)) {
-        credentialsJSON = readFileSync(credPath, "utf-8");
-      }
-    }
-    if (!credentialsJSON) return;
-    const credentials = JSON.parse(credentialsJSON);
-    accessToken = credentials.claudeAiOauth?.accessToken || "";
-    if (!accessToken) return;
-    const expiresAt = credentials.claudeAiOauth?.expiresAt;
-    if (expiresAt && now > expiresAt) return;
-  } catch {
-    return;
+    });
   }
+  credentialLoaders.push(() => {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    if (!existsSync(credPath)) return null;
+    try {
+      return readFileSync(credPath, "utf-8");
+    } catch {
+      return null;
+    }
+  });
 
-  const currentTokenPrefix = accessToken.slice(-20);
-  const tokenChanged = cachedTokenPrefix && currentTokenPrefix !== cachedTokenPrefix;
+  for (const load of credentialLoaders) {
+    const credentialsJSON = load();
+    if (!credentialsJSON) continue;
+    try {
+      const credentials = JSON.parse(credentialsJSON);
+      const token = credentials.claudeAiOauth?.accessToken || "";
+      if (!token) continue;
+      const expiresAt = credentials.claudeAiOauth?.expiresAt;
+      if (expiresAt && now > expiresAt) continue;
+      accessToken = token;
+      break;
+    } catch {
+      // Invalid JSON in this candidate — try next.
+    }
+  }
+  if (!accessToken) return;
+
+  const currentTokenHash = createHash("sha256").update(accessToken).digest("hex").slice(0, 16);
+  const tokenChanged = cachedTokenHash && currentTokenHash !== cachedTokenHash;
 
   // Skip if cache is fresh and token hasn't rotated
   if (!tokenChanged && lastAttempt && now - lastAttempt < ANTHROPIC_TTL_MS) return;
 
   // Mark attempt before HTTP — protects against repeated failures hammering the API
-  try { writeFileSync(cacheFile, JSON.stringify({ data: staleData, lastAttempt: now, tokenPrefix: currentTokenPrefix }), "utf-8"); } catch {}
+  try { writeFileSync(cacheFile, JSON.stringify({ data: staleData, lastAttempt: now, tokenHash: currentTokenHash }), "utf-8"); } catch {}
 
   try {
     const apiUrl = "https://api.anthropic.com/api/oauth/usage";
-    const curlCmd = `curl -sf "${apiUrl}" -H "Authorization: Bearer ${accessToken}" -H "anthropic-beta: oauth-2025-04-20"`;
-    const response = execSync(curlCmd, { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
+    const response = execFileSync(
+      "curl",
+      ["-sf", "-H", `Authorization: Bearer ${accessToken}`, "-H", "anthropic-beta: oauth-2025-04-20", "--", apiUrl],
+      { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] }
+    );
     if (!response) return;
     const data = JSON.parse(response);
     try { writeFileSync(join(tmpdir(), "sl-claude-usage-raw"), JSON.stringify(data, null, 2), "utf-8"); } catch {}
@@ -161,7 +182,7 @@ function refreshClaudeUsage(): void {
 
     const result: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } = { fiveHour, sevenDay };
     if (fiveHourResetsAt) result.fiveHourResetsAt = fiveHourResetsAt;
-    writeFileSync(cacheFile, JSON.stringify({ data: result, lastAttempt: now, tokenPrefix: currentTokenPrefix }), "utf-8");
+    writeFileSync(cacheFile, JSON.stringify({ data: result, lastAttempt: now, tokenHash: currentTokenHash }), "utf-8");
   } catch {}
 }
 
@@ -192,7 +213,7 @@ function refreshCcclubRank(): void {
     if (!code || !userId) return;
     const tz = -(new Date()).getTimezoneOffset();
     const url = `${config.apiUrl}/api/rank/${code}?period=today&tz=${tz}`;
-    const response = execSync(`curl -sf "${url}"`, { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
+    const response = execFileSync("curl", ["-sf", "--", url], { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
     if (!response) return;
     const data = JSON.parse(response);
     const rankings = data.rankings || [];
