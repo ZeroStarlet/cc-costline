@@ -18,6 +18,14 @@ npm i -g cc-costline && cc-costline install
 
 打开一个新的 Claude Code 会话即可看到增强状态栏。需要 Node.js >= 22。
 
+### 升级
+
+npm 不会自动更新全局包。想升级到最新版本时手动运行：
+
+```bash
+npm i -g cc-costline@latest
+```
+
 ## 功能一览
 
 | 模块 | 示例 | 说明 |
@@ -54,11 +62,16 @@ cc-costline config --period both # 同时显示两个周期
 ## 工作原理
 
 1. `install` 配置 `~/.claude/settings.json` — 设置状态栏命令并添加会话结束 hook。你的现有设置会被保留。
-2. `render` 在每次对话时被 Claude Code 调用，读取 stdin JSON 获取会话数据，然后按独立 TTL 刷新各数据源：
-   - **本地费用**（2 分钟 TTL）：扫描 `~/.claude/projects/**/*.jsonl`，按模型定价计算 → `~/.cc-costline/cache.json`
-   - **使用率**（5 分钟重试，感知 token 轮换）：从 `api.anthropic.com/api/oauth/usage` 获取 → `/tmp/sl-claude-usage`。检测 OAuth token 轮换后立即重试（新 token 有新的速率配额）。API 失败时保留历史数据。
-   - **ccclub 排名**（5 分钟重试）：从 `ccclub.dev/api/rank` 获取 → `/tmp/sl-ccclub-rank`
-3. `refresh` 也可以手动运行或通过会话结束 hook 预热缓存。
+2. `render` 在每次对话时被 Claude Code 调用，约 65 ms 返回。它只读三份缓存（不发起 HTTP，不扫描全目录）：
+   - **本地费用** → `~/.cc-costline/cache.json`
+   - **使用率** → `/tmp/sl-claude-usage`
+   - **ccclub 排名** → `/tmp/sl-ccclub-rank`
+3. 任一缓存过期时，`render` 启动 detached 子进程 `cc-costline refresh-bg` 在后台刷新。`/tmp/sl-refresh.lock` 防止多个 Claude Code 窗口并发刷新，`/tmp/sl-refresh.last` 限制 30 秒内最多触发一次。
+4. 后台刷新遵守各数据源各自的 TTL：
+   - **本地费用**（2 分钟 TTL）：增量扫描 — 按文件 `mtime+size` 缓存，未变更的文件直接复用（1000+ jsonl 时典型 25 ms vs 冷启动 2 s）
+   - **使用率**（5 分钟重试，感知 token 轮换）：从 `api.anthropic.com/api/oauth/usage` 获取。检测 OAuth token 轮换后立即重试（新 token 有新的速率配额）。API 失败时保留历史数据。
+   - **ccclub 排名**（90 秒重试）：从 `ccclub.dev/api/rank` 获取
+5. `refresh` 也可以手动运行或通过会话结束 hook 预热缓存。
 
 <details>
 <summary>定价表</summary>

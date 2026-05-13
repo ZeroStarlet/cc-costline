@@ -18,6 +18,14 @@ npm i -g cc-costline && cc-costline install
 
 Ouvrez une nouvelle session Claude Code et la statusline enrichie apparaîtra. Nécessite Node.js >= 22.
 
+### Mise à jour
+
+npm ne met pas à jour automatiquement les paquets globaux. Lance ceci pour obtenir la dernière version :
+
+```bash
+npm i -g cc-costline@latest
+```
+
 ## Fonctionnalités
 
 | Segment | Exemple | Description |
@@ -54,11 +62,16 @@ cc-costline config --period both # Afficher les deux périodes
 ## Fonctionnement
 
 1. `install` configure `~/.claude/settings.json` — définit la commande statusline et ajoute des hooks de fin de session. Vos paramètres existants sont préservés.
-2. `render` est appelé par Claude Code à chaque tour de conversation. Il lit le JSON stdin pour les données de session, puis rafraîchit les sources de données avec des TTL séparés :
-   - **Coût local** (TTL 2 min) : parcourt `~/.claude/projects/**/*.jsonl`, applique la tarification par modèle → `~/.cc-costline/cache.json`
-   - **Limites d'utilisation** (retry 5 min, sensible au token) : récupère depuis `api.anthropic.com/api/oauth/usage` → `/tmp/sl-claude-usage`. Détecte la rotation du token OAuth pour relancer immédiatement (nouveau token = nouveau quota de débit). Les données périmées persistent en cas d'échec.
-   - **Rang ccclub** (retry 5 min) : récupère depuis `ccclub.dev/api/rank` → `/tmp/sl-ccclub-rank`
-3. `refresh` peut aussi être exécuté manuellement ou via les hooks de fin de session pour préchauffer le cache.
+2. `render` est appelé par Claude Code à chaque tour et retourne en ~65 ms. Il ne lit que trois caches (aucun HTTP, aucun scan complet du répertoire) :
+   - **Coût local** → `~/.cc-costline/cache.json`
+   - **Limites d'utilisation** → `/tmp/sl-claude-usage`
+   - **Rang ccclub** → `/tmp/sl-ccclub-rank`
+3. Si un cache est obsolète, `render` lance un sous-processus détaché `cc-costline refresh-bg` qui rafraîchit les données en arrière-plan. `/tmp/sl-refresh.lock` empêche les rafraîchissements concurrents entre plusieurs fenêtres Claude Code, et `/tmp/sl-refresh.last` limite les spawns à un toutes les 30 s.
+4. Le rafraîchissement de fond respecte les TTL de chaque source :
+   - **Coût local** (TTL 2 min) : scan incrémental — cache par fichier (`mtime+size`), réutilise les entrées inchangées (~25 ms typique vs ~2 s à froid sur 1000+ fichiers jsonl)
+   - **Limites d'utilisation** (retry 5 min, sensible au token) : récupère depuis `api.anthropic.com/api/oauth/usage`. Détecte la rotation du token OAuth pour relancer immédiatement (nouveau token = nouveau quota de débit). Les données périmées persistent en cas d'échec.
+   - **Rang ccclub** (retry 90 s) : récupère depuis `ccclub.dev/api/rank`
+5. `refresh` peut aussi être exécuté manuellement ou via les hooks de fin de session pour préchauffer le cache.
 
 <details>
 <summary>Grille tarifaire</summary>

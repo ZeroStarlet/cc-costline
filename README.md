@@ -18,6 +18,14 @@ npm i -g cc-costline && cc-costline install
 
 Open a new Claude Code session and you'll see the enhanced statusline. Requires Node.js >= 22.
 
+### Updating
+
+npm doesn't auto-update global packages. Run this whenever you want the latest version:
+
+```bash
+npm i -g cc-costline@latest
+```
+
 ## What you get
 
 | Segment | Example | Description |
@@ -54,11 +62,16 @@ cc-costline config --period both # Show both periods
 ## How it works
 
 1. `install` configures `~/.claude/settings.json` — sets the statusline command and adds session-end hooks. Your existing settings are preserved.
-2. `render` is called by Claude Code on every turn. It reads stdin JSON for session data, then refreshes data sources inline with separate TTLs:
-   - **Local cost** (2-min TTL): scans `~/.claude/projects/**/*.jsonl`, applies per-model pricing → `~/.cc-costline/cache.json`
-   - **Usage limits** (5-min retry, token-aware): fetches `api.anthropic.com/api/oauth/usage` → `/tmp/sl-claude-usage`. Detects OAuth token rotation to retry immediately with fresh rate limit quota. Stale data persists across failures.
-   - **ccclub rank** (5-min retry): fetches `ccclub.dev/api/rank` → `/tmp/sl-ccclub-rank`
-3. `refresh` can also be run manually or via session-end hooks to warm the cost cache.
+2. `render` is called by Claude Code on every turn and returns in ~65 ms. It only reads three caches (no HTTP, no full directory scan):
+   - **Local cost** → `~/.cc-costline/cache.json`
+   - **Usage limits** → `/tmp/sl-claude-usage`
+   - **ccclub rank** → `/tmp/sl-ccclub-rank`
+3. If any cache is stale, `render` spawns a detached `cc-costline refresh-bg` subprocess that refreshes data in the background. `/tmp/sl-refresh.lock` prevents concurrent refresh across multiple Claude Code windows, and `/tmp/sl-refresh.last` throttles spawns to once per 30 s.
+4. The background refresh honors per-source TTLs:
+   - **Local cost** (2-min TTL): incremental scan — per-file `mtime+size` cache reuses entries that haven't changed (~25 ms typical vs ~2 s cold on 1000+ jsonl files)
+   - **Usage limits** (5-min retry, token-aware): fetches `api.anthropic.com/api/oauth/usage`. Detects OAuth token rotation to retry immediately with fresh rate limit quota. Stale data persists across failures.
+   - **ccclub rank** (90 s retry): fetches `ccclub.dev/api/rank`
+5. `refresh` can also be run manually or via session-end hooks to warm the cost cache.
 
 <details>
 <summary>Pricing table</summary>
