@@ -8,8 +8,9 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
 import { collectCosts } from "./collector.js";
-import { writeCache, writeConfig, readConfig, CACHE_DIR } from "./cache.js";
+import { readCache, writeCache, writeConfig, readConfig, CACHE_DIR } from "./cache.js";
 import { render } from "./statusline.js";
+import { refreshAll } from "./refresh.js";
 
 const SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
 const RENDER_COMMAND = "cc-costline render";
@@ -142,11 +143,13 @@ function cmdConfig(args: string[]): void {
 }
 
 function cmdRefresh(): void {
-  const result = collectCosts();
+  const prev = readCache();
+  const result = collectCosts(undefined, prev?.files);
   writeCache({
     cost7d: result.cost7d,
     cost30d: result.cost30d,
     updatedAt: new Date().toISOString(),
+    files: result.files,
   });
   console.log(
     `✓ Cache updated — 7d: $${result.cost7d.toFixed(2)} | 30d: $${result.cost30d.toFixed(2)}`
@@ -158,6 +161,11 @@ function cmdRender(): void {
   if (!input.trim()) return;
   const output = render(input);
   if (output) process.stdout.write(output);
+}
+
+function cmdRefreshBg(args: string[]): void {
+  const transcriptPath = args[0] || "";
+  refreshAll(transcriptPath);
 }
 
 // ─── Main ─────────────────────────────────────────────────
@@ -177,6 +185,9 @@ switch (command) {
     break;
   case "refresh":
     cmdRefresh();
+    break;
+  case "refresh-bg":
+    cmdRefreshBg(args.slice(1));
     break;
   case "render":
     cmdRender();

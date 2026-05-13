@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync, statSync, utimesSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { collectCosts } from "../dist/collector.js";
@@ -245,6 +245,99 @@ describe("collectCosts", () => {
     // line1: 0.0105, line2: 0.0105 + 5000*3.75/1M = 0.0105 + 0.01875 = 0.02925
     const expected = 0.0105 + 0.02925;
     assert.ok(Math.abs(result.cost7d - expected) < 0.001, `expected ~${expected}, got ${result.cost7d}`);
+  });
+
+  it("returns per-file scan cache in result.files", () => {
+    const dir = join(tmpDir, "project");
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, "session.jsonl");
+    writeFileSync(filePath, jsonlLine({ requestId: "r1" }) + "\n");
+
+    const result = collectCosts(tmpDir) as any;
+    assert.ok(result.files, "should return files map");
+    assert.ok(result.files[filePath], `should include entry for ${filePath}`);
+    const entry = result.files[filePath];
+    assert.equal(typeof entry.mtimeMs, "number");
+    assert.equal(typeof entry.size, "number");
+    assert.ok(entry.byDay, "should have byDay buckets");
+  });
+
+  it("reuses cached entry when file mtime/size unchanged", () => {
+    const dir = join(tmpDir, "project");
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, "session.jsonl");
+    writeFileSync(filePath, jsonlLine({ requestId: "r1" }) + "\n");
+
+    const first = collectCosts(tmpDir) as any;
+    const firstEntry = first.files[filePath];
+
+    // Re-run with prev cache. File untouched → entry should be reused (same byDay).
+    const second = collectCosts(tmpDir, first.files) as any;
+    const secondEntry = second.files[filePath];
+
+    assert.equal(secondEntry.mtimeMs, firstEntry.mtimeMs);
+    assert.equal(secondEntry.size, firstEntry.size);
+    assert.deepEqual(secondEntry.byDay, firstEntry.byDay);
+    assert.ok(Math.abs(second.cost7d - first.cost7d) < 0.0001);
+  });
+
+  it("re-parses file when mtime changes", () => {
+    const dir = join(tmpDir, "project");
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, "session.jsonl");
+    writeFileSync(filePath, jsonlLine({ requestId: "r1" }) + "\n");
+
+    const first = collectCosts(tmpDir) as any;
+    const firstCost = first.cost7d;
+
+    // Append another entry, mtime + size both change
+    appendFileSync(filePath, jsonlLine({ requestId: "r2" }) + "\n");
+    // Force a new mtime in case the second write happened in the same millisecond
+    const future = new Date(Date.now() + 1000);
+    utimesSync(filePath, future, future);
+
+    const second = collectCosts(tmpDir, first.files) as any;
+    assert.ok(second.cost7d > firstCost, `expected cost to grow after append, got ${second.cost7d} vs ${firstCost}`);
+  });
+
+  it("skips files with mtime older than 30 days", () => {
+    const dir = join(tmpDir, "project");
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, "old.jsonl");
+    // Write a line with timestamp inside 30d (shouldn't matter — mtime gate hits first)
+    writeFileSync(filePath, jsonlLine({ requestId: "r1" }) + "\n");
+    const oldDate = new Date(Date.now() - 40 * 86400_000);
+    utimesSync(filePath, oldDate, oldDate);
+
+    const result = collectCosts(tmpDir) as any;
+    assert.equal(result.cost7d, 0);
+    assert.equal(result.cost30d, 0);
+    assert.equal(result.files[filePath], undefined, "should not include stale file in files map");
+  });
+
+  it("prunes day buckets that have slid past the 30d window when reusing cached entry", () => {
+    const dir = join(tmpDir, "project");
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, "session.jsonl");
+    writeFileSync(filePath, jsonlLine({ requestId: "r1" }) + "\n");
+    const stat = statSync(filePath);
+
+    // Synthesize a prev cache that includes an ancient day bucket (40 days ago)
+    const ancientDay = (() => {
+      const d = new Date(Date.now() - 40 * 86400_000);
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    })();
+    const prev = {
+      [filePath]: {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        byDay: { [ancientDay]: 999, "2026-05-14": 0.5 },
+      },
+    };
+
+    const result = collectCosts(tmpDir, prev) as any;
+    const entry = result.files[filePath];
+    assert.equal(entry.byDay[ancientDay], undefined, "ancient day should be pruned");
   });
 
   it("includes cache token costs", () => {

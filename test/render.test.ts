@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { render } from "../dist/statusline.js";
+
+// Disable background refresh spawn before importing statusline
+process.env.CC_COSTLINE_NO_SPAWN = "1";
+
+const { render } = await import("../dist/statusline.js");
 
 // Helper to strip ANSI escape codes for easier assertions
 function stripAnsi(s: string): string {

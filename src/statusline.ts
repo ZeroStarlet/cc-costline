@@ -1,15 +1,16 @@
-import { readFileSync, existsSync, statSync, writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { execSync } from "node:child_process";
-import { readCache, writeCache, readConfig } from "./cache.js";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readCache, readConfig } from "./cache.js";
 import type { CacheData } from "./cache.js";
-import { collectCosts } from "./collector.js";
 
-// TTL for local cost cache (2 minutes)
+// TTL for local cost cache (2 minutes) — used by refresh-bg to decide whether to rescan jsonl
 const CACHE_TTL_MS = 120_000;
-// TTL for external API retry throttle (5 minutes) — usage API has strict per-token rate limits (~5 req/token)
-const API_RETRY_TTL_MS = 300_000;
+
+// Throttle: render only spawns a background refresh if the last one finished > 30s ago.
+// refresh-bg internally honors per-API TTLs (Anthropic 5min, ccclub 90s) so this is just
+// a coarse "don't fork node every turn" gate.
+const REFRESH_SPAWN_THROTTLE_MS = 30_000;
+const REFRESH_LAST_MARKER = "/tmp/sl-refresh.last";
 
 // ANSI colors (matching original statusline.sh)
 const FG_GRAY      = "\x1b[38;5;245m";
@@ -71,44 +72,6 @@ export function shouldRefreshLocalCostCache(
   return now - cacheUpdatedAt >= CACHE_TTL_MS;
 }
 
-// ccclub rank fetcher — split cache: data persists, retry throttled
-function getCcclubRank(): { rank: number; total: number; cost: number } | null {
-  const configPath = join(homedir(), ".ccclub", "config.json");
-  if (!existsSync(configPath)) return null;
-  const cacheFile = "/tmp/sl-ccclub-rank";
-  const now = Date.now();
-  let staleData: { rank: number; total: number; cost: number } | null = null;
-  let lastAttempt = 0;
-  if (existsSync(cacheFile)) {
-    try {
-      const cached = JSON.parse(readFileSync(cacheFile, "utf-8"));
-      staleData = cached.data ?? null;
-      lastAttempt = cached.lastAttempt || cached.timestamp || 0;
-      if (now - lastAttempt < API_RETRY_TTL_MS) return staleData;
-    } catch { }
-  }
-  try { writeFileSync(cacheFile, JSON.stringify({ data: staleData, timestamp: staleData ? (lastAttempt || now) : 0, lastAttempt: now }), "utf-8"); } catch {}
-  try {
-    const config = JSON.parse(readFileSync(configPath, "utf-8"));
-    const code = config.groups?.[0];
-    const userId = config.userId;
-    if (!code || !userId) return staleData;
-    const tz = -(new Date()).getTimezoneOffset();
-    const url = `${config.apiUrl}/api/rank/${code}?period=today&tz=${tz}`;
-    const response = execSync(`curl -sf "${url}"`, { encoding: "utf-8", timeout: 5000 });
-    if (!response) return staleData;
-    const data = JSON.parse(response);
-    const rankings = data.rankings || [];
-    const me = rankings.find((r: any) => r.userId === userId);
-    if (!me) return staleData;
-    const result = { rank: me.rank, total: rankings.length, cost: me.costUSD };
-    writeFileSync(cacheFile, JSON.stringify({ data: result, timestamp: now, lastAttempt: now }), "utf-8");
-    return result;
-  } catch {
-    return staleData;
-  }
-}
-
 export function rankColor(rank: number): string {
   if (rank === 1) return FG_YELLOW;
   if (rank === 2) return FG_WHITE;
@@ -116,99 +79,47 @@ export function rankColor(rank: number): string {
   return FG_CYAN;
 }
 
-// Claude usage fetcher — token-aware cache: detects token rotation to retry immediately
-function getClaudeUsage(): { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null {
-  const cacheFile = "/tmp/sl-claude-usage";
-  const hitFile = "/tmp/sl-claude-usage-hit";
-  const now = Date.now();
-  // Cache format: { data, lastAttempt, tokenPrefix (first 20 chars of token) }
-  let staleData: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null = null;
-  let lastAttempt = 0;
-  let cachedTokenPrefix = "";
-  if (existsSync(cacheFile)) {
-    try {
-      const cached = JSON.parse(readFileSync(cacheFile, "utf-8"));
-      staleData = cached.data ?? null;
-      lastAttempt = cached.lastAttempt || 0;
-      cachedTokenPrefix = cached.tokenPrefix || "";
-    } catch { }
-  }
-
-  // Get current token
-  let accessToken = "";
+// Read-only: usage data from /tmp cache. Refresh is done by `cc-costline refresh-bg`.
+function readUsageCache(): { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null {
   try {
-    const username = process.env.USER || process.env.USERNAME;
-    const keychainCmd = `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w 2>/dev/null`;
-    const credentialsJSON = execSync(keychainCmd, { encoding: "utf-8", timeout: 2000 }).trim();
-    if (!credentialsJSON) return staleData;
-    const credentials = JSON.parse(credentialsJSON);
-    accessToken = credentials.claudeAiOauth?.accessToken || "";
-    if (!accessToken) return staleData;
-    const expiresAt = credentials.claudeAiOauth?.expiresAt;
-    if (expiresAt && now > expiresAt) return staleData;
+    const cached = JSON.parse(readFileSync("/tmp/sl-claude-usage", "utf-8"));
+    return cached.data ?? null;
   } catch {
-    return staleData;
+    return null;
   }
+}
 
-  const currentTokenPrefix = accessToken.slice(-20);
-  const tokenChanged = cachedTokenPrefix && currentTokenPrefix !== cachedTokenPrefix;
+// Read-only: ccclub rank from /tmp cache.
+function readRankCache(): { rank: number; total: number; cost: number } | null {
+  try {
+    const cached = JSON.parse(readFileSync("/tmp/sl-ccclub-rank", "utf-8"));
+    return cached.data ?? null;
+  } catch {
+    return null;
+  }
+}
 
-  // Throttle: skip API call unless token rotated or TTL expired
-  if (!tokenChanged && lastAttempt && now - lastAttempt < API_RETRY_TTL_MS) return staleData;
+// Spawn detached `cc-costline refresh-bg` subprocess. Render does NOT wait for it.
+// The subprocess uses a lockfile to prevent concurrent refresh across multiple Claude Code windows.
+function maybeSpawnRefresh(transcriptPath: string): void {
+  if (process.env.CC_COSTLINE_NO_SPAWN) return;
 
-  // Mark attempt and store token prefix
-  try { writeFileSync(cacheFile, JSON.stringify({ data: staleData, lastAttempt: now, tokenPrefix: currentTokenPrefix }), "utf-8"); } catch {}
+  const entry = process.argv[1] || "";
+  if (!/cc-costline|cli\.js$/.test(entry)) return;
 
   try {
-    const apiUrl = "https://api.anthropic.com/api/oauth/usage";
-    const curlCmd = `curl -sf "${apiUrl}" -H "Authorization: Bearer ${accessToken}" -H "anthropic-beta: oauth-2025-04-20"`;
-    const response = execSync(curlCmd, { encoding: "utf-8", timeout: 5000 });
-    if (!response) return staleData;
-    const data = JSON.parse(response);
-    // Debug: save raw API response for diagnosis
-    try { writeFileSync("/tmp/sl-claude-usage-raw", JSON.stringify(data, null, 2), "utf-8"); } catch {}
-    const parseUtil = (val: any): number => {
-      if (typeof val === "number") return Math.round(val);
-      if (typeof val === "string") return Math.round(parseFloat(val.replace("%", "")));
-      return 0;
-    };
-    const fiveHour = parseUtil(data.five_hour?.utilization);
-    const sevenDay = parseUtil(data.seven_day?.utilization);
+    const stat = statSync(REFRESH_LAST_MARKER);
+    if (Date.now() - stat.mtimeMs < REFRESH_SPAWN_THROTTLE_MS) return;
+  } catch { }
 
-    let fiveHourResetsAt: number | undefined;
-
-    // Strategy 1: Use reset time from API if available
-    const resetsAtRaw = data.five_hour?.resets_at ?? data.five_hour?.reset_at ?? data.five_hour?.next_reset;
-    if (resetsAtRaw) {
-      const ts = typeof resetsAtRaw === "string" ? new Date(resetsAtRaw).getTime() : resetsAtRaw * 1000;
-      if (!isNaN(ts) && ts > now) fiveHourResetsAt = ts;
-    }
-
-    // Strategy 2: Fallback - track when we first saw 100%
-    if (fiveHour >= 100) {
-      if (!fiveHourResetsAt) {
-        if (existsSync(hitFile)) {
-          const hitTime = parseFloat(readFileSync(hitFile, "utf-8").trim());
-          if (!isNaN(hitTime)) {
-            fiveHourResetsAt = hitTime + 5 * 3600 * 1000;
-          }
-        } else {
-          writeFileSync(hitFile, String(now), "utf-8");
-          fiveHourResetsAt = now + 5 * 3600 * 1000;
-        }
-      }
-    } else {
-      // Usage dropped below 100%, clear hit tracker
-      try { if (existsSync(hitFile)) unlinkSync(hitFile); } catch {}
-    }
-
-    const result: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } = { fiveHour, sevenDay };
-    if (fiveHourResetsAt) result.fiveHourResetsAt = fiveHourResetsAt;
-    writeFileSync(cacheFile, JSON.stringify({ data: result, lastAttempt: now, tokenPrefix: currentTokenPrefix }), "utf-8");
-    return result;
-  } catch {
-    return staleData;
-  }
+  try {
+    const child = spawn(
+      process.execPath,
+      [entry, "refresh-bg", transcriptPath],
+      { detached: true, stdio: "ignore" },
+    );
+    child.unref();
+  } catch { }
 }
 
 export function render(input: string): string {
@@ -223,10 +134,9 @@ export function render(input: string): string {
   const cost = data.cost?.total_cost_usd ?? 0;
   const model = (data.model?.display_name ?? "—").replace(/\s*\((\d+[KMB])\s+context\)/i, " ($1)");
   const contextPct = Math.floor(data.context_window?.used_percentage ?? 0);
-
   const transcriptPath = data.transcript_path ?? "";
 
-  // Token stats from transcript
+  // Token stats from transcript (synchronous — small per-session file, typically < 1ms)
   let totalTokens = 0;
   if (transcriptPath) {
     try {
@@ -244,22 +154,15 @@ export function render(input: string): string {
     } catch { }
   }
 
-  // Refresh local cost cache if stale
-  let cache = readCache();
-  if (shouldRefreshLocalCostCache(cache, transcriptPath)) {
-    try {
-      const result = collectCosts();
-      // Don't overwrite valid cache with zeros (directory read failure)
-      if (result.cost7d > 0 || result.cost30d > 0 || !cache) {
-        const newCache = { cost7d: result.cost7d, cost30d: result.cost30d, updatedAt: new Date().toISOString() };
-        writeCache(newCache);
-        cache = newCache;
-      }
-    } catch {}
-  }
-
+  // All external data is read-only here. refresh-bg writes these caches in the background.
+  const cache = readCache();
   const config = readConfig();
-  const claudeUsage = getClaudeUsage();
+  const claudeUsage = readUsageCache();
+  const ccclubRank = readRankCache();
+
+  // Fire-and-forget background refresh (throttled to once per 30s)
+  maybeSpawnRefresh(transcriptPath);
+
   const g = FG_GRAY_DIM;
   const y = FG_YELLOW;
   const m = FG_MODEL;
@@ -300,7 +203,6 @@ export function render(input: string): string {
   }
 
   // #2 $53.6
-  const ccclubRank = getCcclubRank();
   if (ccclubRank) {
     const rc = rankColor(ccclubRank.rank);
     segments.push(`${rc}#${ccclubRank.rank} ${formatCost(ccclubRank.cost)}${r}`);

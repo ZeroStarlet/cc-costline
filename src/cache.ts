@@ -4,10 +4,21 @@ import { homedir } from "node:os";
 
 const CACHE_DIR = join(homedir(), ".cc-costline");
 
+export interface FileCostEntry {
+  mtimeMs: number;
+  size: number;
+  // Per-day cost buckets, keyed by UTC date "YYYY-MM-DD".
+  // Day-bucket accuracy means cost7d/cost30d carry up to ~1 day boundary slop, which
+  // is negligible vs. the cost of storing/scanning per-entry timestamps.
+  byDay: Record<string, number>;
+}
+
 export interface CacheData {
   cost7d: number;
   cost30d: number;
   updatedAt: string;
+  // Optional: per-file scan cache for incremental collectCosts. Absent in legacy cache.
+  files?: Record<string, FileCostEntry>;
 }
 
 export interface ConfigData {
