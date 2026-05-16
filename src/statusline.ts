@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, utimesSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -82,20 +82,37 @@ export function rankColor(rank: number): string {
 }
 
 // Read-only: usage data from temp cache. Refresh is done by `cc-costline refresh-bg`.
+// Validates shape so a corrupted or legacy cache can't surface `5h: null%` in the UI.
 function readUsageCache(): { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } | null {
   try {
     const cached = JSON.parse(readFileSync(join(tmpdir(), "sl-claude-usage"), "utf-8"));
-    return cached.data ?? null;
+    const d = cached?.data;
+    if (!d || typeof d !== "object") return null;
+    if (typeof d.fiveHour !== "number" || !isFinite(d.fiveHour)) return null;
+    if (typeof d.sevenDay !== "number" || !isFinite(d.sevenDay)) return null;
+    const out: { fiveHour: number; sevenDay: number; fiveHourResetsAt?: number } = {
+      fiveHour: d.fiveHour,
+      sevenDay: d.sevenDay,
+    };
+    if (typeof d.fiveHourResetsAt === "number" && isFinite(d.fiveHourResetsAt)) {
+      out.fiveHourResetsAt = d.fiveHourResetsAt;
+    }
+    return out;
   } catch {
     return null;
   }
 }
 
-// Read-only: ccclub rank from temp cache.
+// Read-only: ccclub rank from temp cache. Validates shape so render can't crash on bad data.
 function readRankCache(): { rank: number; total: number; cost: number } | null {
   try {
     const cached = JSON.parse(readFileSync(join(tmpdir(), "sl-ccclub-rank"), "utf-8"));
-    return cached.data ?? null;
+    const d = cached?.data;
+    if (!d || typeof d !== "object") return null;
+    if (typeof d.rank !== "number" || !isFinite(d.rank)) return null;
+    if (typeof d.cost !== "number" || !isFinite(d.cost)) return null;
+    const total = typeof d.total === "number" && isFinite(d.total) ? d.total : 0;
+    return { rank: d.rank, total, cost: d.cost };
   } catch {
     return null;
   }
@@ -107,18 +124,35 @@ function maybeSpawnRefresh(transcriptPath: string): void {
   if (process.env.CC_COSTLINE_NO_SPAWN) return;
 
   const entry = process.argv[1] || "";
-  if (!/cc-costline|cli\.js$/.test(entry)) return;
+  // Anchored to a path component end so `cc-costlineadmin` and other near-matches
+  // don't accidentally satisfy the gate. Matches both `cc-costline`, `cc-costline.cmd`,
+  // and the source-relative `dist/cli.js` form used during development.
+  if (!/(^|[\\/])(cc-costline(\.cmd|\.exe)?|cli\.js)$/.test(entry)) return;
 
   try {
     const stat = statSync(REFRESH_LAST_MARKER);
     if (Date.now() - stat.mtimeMs < REFRESH_SPAWN_THROTTLE_MS) return;
   } catch { }
 
+  // Touch the marker BEFORE spawning. Otherwise during a slow refresh (cold scan +
+  // two HTTP fetches can easily take a few seconds), every subsequent render would
+  // see the stale marker and spawn another refresh-bg subprocess. The in-process
+  // lock would block them from doing real work, but we'd still fork node N times.
+  try {
+    const now = new Date();
+    if (!existsSync(REFRESH_LAST_MARKER)) {
+      writeFileSync(REFRESH_LAST_MARKER, "");
+    }
+    utimesSync(REFRESH_LAST_MARKER, now, now);
+  } catch { }
+
   try {
     const child = spawn(
       process.execPath,
       [entry, "refresh-bg", transcriptPath],
-      { detached: true, stdio: "ignore" },
+      // windowsHide suppresses the brief console-window flash that Windows would
+      // otherwise show for every detached subprocess.
+      { detached: true, stdio: "ignore", windowsHide: true },
     );
     child.unref();
   } catch { }
@@ -138,7 +172,10 @@ export function render(input: string): string {
   const contextPct = Math.floor(data.context_window?.used_percentage ?? 0);
   const transcriptPath = data.transcript_path ?? "";
 
-  // Token stats from transcript (synchronous — small per-session file, typically < 1ms)
+  // Token stats from transcript (synchronous — small per-session file, typically < 1ms).
+  // Includes ALL four token types so the displayed count matches what cost was
+  // calculated from; previously cache_creation/cache_read tokens were billed but
+  // hidden from the user's "tokens" counter.
   let totalTokens = 0;
   if (transcriptPath) {
     try {
@@ -149,7 +186,11 @@ export function render(input: string): string {
         try {
           const entry = JSON.parse(line);
           if (entry.type === "assistant" && entry.message?.usage) {
-            totalTokens += (entry.message.usage.input_tokens || 0) + (entry.message.usage.output_tokens || 0);
+            const u = entry.message.usage;
+            totalTokens += (u.input_tokens || 0)
+              + (u.output_tokens || 0)
+              + (u.cache_creation_input_tokens || 0)
+              + (u.cache_read_input_tokens || 0);
           }
         } catch { }
       }
@@ -208,10 +249,13 @@ export function render(input: string): string {
     segments.push(periodCostParts.join(` ${g}/${r} `));
   }
 
-  // #2 $53.6
+  // #2/22 $53.6   (when total is known) or #2 $53.6 (when not)
   if (ccclubRank) {
     const rc = rankColor(ccclubRank.rank);
-    segments.push(`${rc}#${ccclubRank.rank} ${formatCost(ccclubRank.cost)}${r}`);
+    const rankStr = ccclubRank.total > 0
+      ? `#${ccclubRank.rank}/${ccclubRank.total}`
+      : `#${ccclubRank.rank}`;
+    segments.push(`${rc}${rankStr} ${formatCost(ccclubRank.cost)}${r}`);
   }
 
   return " " + segments.join(` ${gr}|${r} `);
